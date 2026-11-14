@@ -48,6 +48,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.lagradost.cloudstream3.APIHolder.getApiFromNameNull
 import com.lagradost.cloudstream3.CloudStreamApp
+import com.lagradost.cloudstream3.CloudStreamApp.Companion.getKey
 import com.lagradost.cloudstream3.CloudStreamApp.Companion.setKey
 import com.lagradost.cloudstream3.CommonActivity.showToast
 import com.lagradost.cloudstream3.LoadResponse
@@ -100,6 +101,7 @@ import com.lagradost.cloudstream3.ui.settings.Globals.TV
 import com.lagradost.cloudstream3.ui.settings.Globals.isLayout
 import com.lagradost.cloudstream3.ui.settings.SettingsFragmentScreen.launchSafe
 import com.lagradost.cloudstream3.ui.subtitles.SUBTITLE_AUTO_SELECT_KEY
+import com.lagradost.cloudstream3.ui.subtitles.SUBTITLE_DOWNLOAD_KEY
 import com.lagradost.cloudstream3.ui.subtitles.SubtitlesFragment
 import com.lagradost.cloudstream3.ui.subtitles.SubtitlesFragment.Companion.getAutoSelectLanguageTagIETF
 import com.lagradost.cloudstream3.ui.subtitles.SubtitlesFragmentDialog2
@@ -187,6 +189,7 @@ class GeneratorPlayer : FullScreenPlayer() {
 
     private var isPlayerActive: AtomicBoolean = AtomicBoolean(false)
     private var isNextEpisode: Boolean = false // this is used to reset the watch time
+    private var hasAutoFetchedSubtitles: Boolean = false
 
     private var preferredAutoSelectSubtitles: String? = null // null means do nothing, "" means none
     private val allMeta: List<ResultEpisode>?
@@ -520,14 +523,20 @@ class GeneratorPlayer : FullScreenPlayer() {
         //  setEpisodes(viewModel.getAllMeta() ?: emptyList())
         setPlayerDimen(null)
         setTitle()
-        if (!sameEpisode)
+        if (!sameEpisode) {
             hasRequestedStamps = false
+            hasAutoFetchedSubtitles = false
+        }
 
         loadExtractorJob(link.first)
         // load player
         context?.let { ctx ->
             val (url, uri) = link
             val subtitles = viewModel.state.subtitles
+            val autoSelected = (if (sameEpisode) currentSelectedSubtitles else null)
+                ?: getAutoSelectSubtitle(
+                    subtitles, settings = true, downloads = true
+                )
             player.loadPlayer(
                 ctx,
                 sameEpisode,
@@ -537,11 +546,19 @@ class GeneratorPlayer : FullScreenPlayer() {
                     if (isNextEpisode) 0L else getPos()
                 },
                 subtitles,
-                (if (sameEpisode) currentSelectedSubtitles else null) ?: getAutoSelectSubtitle(
-                    subtitles, settings = true, downloads = true
-                ),
+                autoSelected,
                 preview = true
             )
+
+            val targetLang = getPreferredOnlineSubtitleLang()
+            val hasPreferredSub = targetLang != null && subtitles.any {
+                it.getIETF_tag()?.equals(targetLang, ignoreCase = true) == true ||
+                    it.languageCode?.equals(targetLang, ignoreCase = true) == true
+            }
+            if (!sameEpisode && !hasPreferredSub && !hasAutoFetchedSubtitles && subsProvidersIsActive) {
+                hasAutoFetchedSubtitles = true
+                autoFetchOnlineSubtitles(link.first?.name)
+            }
         }
 
         if (!sameEpisode) {
@@ -1005,6 +1022,138 @@ class GeneratorPlayer : FullScreenPlayer() {
             // maybe better error here?
             if (!hasSelectASubtitle && this.isActive) {
                 showToast(R.string.no_subtitles)
+            }
+        }
+
+    private fun getPreferredOnlineSubtitleLang(): String? {
+        val downloadLang = getKey<List<String>>(SUBTITLE_DOWNLOAD_KEY)
+            ?.firstOrNull { it.isNotBlank() }
+        if (!downloadLang.isNullOrBlank()) return downloadLang
+
+        return (preferredAutoSelectSubtitles ?: getAutoSelectLanguageTagIETF())
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun cleanSubtitleTitle(rawTitle: String?): String {
+        if (rawTitle.isNullOrBlank()) return ""
+        return rawTitle
+            .replace(Regex("\\[.*?\\]|\\(.*?\\)"), " ")
+            .replace(
+                Regex("(?i)\\b(dub|sub|dubbed|subbed|hindi|bangla|bengali|english|dual audio|4k|1080p|720p|480p|web-dl|webrip|bluray|hdrip)\\b"),
+                " "
+            )
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun isMatchingEpisode(entryName: String, season: Int?, episode: Int?): Boolean {
+        if (episode == null) return true
+        val s = season ?: 1
+        val sPad = s.toString().padStart(2, '0')
+        val ePad = episode.toString().padStart(2, '0')
+
+        val patterns = listOf(
+            Regex("(?i)\\bS0?${s}[ ._-]*E0?${episode}\\b"),
+            Regex("(?i)\\b${s}x0?${episode}\\b"),
+            Regex("(?i)\\b(?:E|Ep|Episode)[ ._-]*0?${episode}\\b")
+        )
+        val hasExplicitPattern = Regex("(?i)\\bS\\d{1,2}[ ._-]*E\\d{1,3}\\b|\\b\\d{1,2}x\\d{1,3}\\b")
+        return if (hasExplicitPattern.containsMatchIn(entryName)) {
+            patterns.any { it.containsMatchIn(entryName) }
+        } else {
+            entryName.contains("S${sPad}E${ePad}", ignoreCase = true) ||
+                patterns.any { it.containsMatchIn(entryName) }
+        }
+    }
+
+    private fun scoreSubtitleEntry(entryName: String, sourceName: String?): Int {
+        if (sourceName.isNullOrBlank()) return 0
+        val tokens = listOf("WEB-DL", "WEBRip", "BluRay", "HDRip", "1080p", "720p", "x265", "x264", "HEVC")
+        var score = 0
+        for (token in tokens) {
+            if (sourceName.contains(token, ignoreCase = true) &&
+                entryName.contains(token, ignoreCase = true)
+            ) {
+                score += 1
+            }
+        }
+        return score
+    }
+
+    private fun autoFetchOnlineSubtitles(sourceName: String? = null) =
+        viewModel.viewModelScope.launch {
+            val langTag = getPreferredOnlineSubtitleLang() ?: return@launch
+            val meta = getMetaData()
+            val rawName = meta.name ?: currentLoadResponse?.name
+            val cleanedName = cleanSubtitleTitle(rawName)
+            val imdbId = currentLoadResponse?.getImdbId() ?: meta.imdbId
+            val tmdbId = currentLoadResponse?.getTMDbId()?.toIntOrNull()
+            val malId = currentLoadResponse?.getMalId()?.toIntOrNull()
+            val aniListId = currentLoadResponse?.getAniListId()?.toIntOrNull()
+
+            if (cleanedName.isBlank() && imdbId.isNullOrBlank() && tmdbId == null) return@launch
+
+            val primaryQuery = SubtitleSearch(
+                query = cleanedName.ifBlank { rawName.orEmpty() },
+                imdbId = imdbId,
+                tmdbId = tmdbId,
+                malId = malId,
+                aniListId = aniListId,
+                epNumber = meta.episode,
+                seasonNumber = meta.season,
+                lang = langTag,
+                year = viewModel.currentSubtitleYear.value
+            )
+
+            var hasSelected = false
+
+            suspend fun tryProviders(query: SubtitleSearch) {
+                subsProviders.toList().amap { provider ->
+                    if (hasSelected || !this@launch.isActive) return@amap
+
+                    val result = Resource.fromResult(provider.search(query = query))
+                    val entries = (result as? Resource.Success)?.value ?: return@amap
+
+                    val filtered = if (meta.episode != null) {
+                        entries.filter { isMatchingEpisode(it.name, meta.season, meta.episode) }
+                    } else {
+                        entries
+                    }.sortedByDescending { scoreSubtitleEntry(it.name, sourceName) }
+
+                    for (subtitleEntry in filtered) {
+                        if (hasSelected || !this@launch.isActive) break
+
+                        val subtitleResources = provider.resource(subtitleEntry).getOrNull() ?: continue
+                        val subtitles = subtitleResources.getSubtitles().map { resource ->
+                            SubtitleData(
+                                originalName = resource.name ?: getName(subtitleEntry, true),
+                                nameSuffix = "",
+                                url = resource.url,
+                                origin = resource.origin,
+                                mimeType = resource.url.toSubtitleMimeType(),
+                                headers = subtitleEntry.headers,
+                                languageCode = subtitleEntry.lang,
+                            )
+                        }
+
+                        if (subtitles.isNotEmpty() && this@launch.isActive &&
+                            !viewModel.state.subtitles.containsAll(subtitles) && !hasSelected
+                        ) {
+                            hasSelected = true
+                            runOnMainThread {
+                                addAndSelectSubtitles(*subtitles.toTypedArray())
+                            }
+                            break
+                        }
+                    }
+                }
+            }
+
+            tryProviders(primaryQuery)
+
+            // Fallback without year if primary query returned nothing
+            if (!hasSelected && this.isActive && primaryQuery.year != null && cleanedName.isNotBlank()) {
+                tryProviders(primaryQuery.copy(year = null))
             }
         }
 
