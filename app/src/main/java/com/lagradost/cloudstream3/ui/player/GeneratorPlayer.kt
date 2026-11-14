@@ -1083,6 +1083,7 @@ class GeneratorPlayer : FullScreenPlayer() {
     private fun autoFetchOnlineSubtitles(sourceName: String? = null) =
         viewModel.viewModelScope.launch {
             val langTag = getPreferredOnlineSubtitleLang() ?: return@launch
+            val currentLoadResponse = viewModel.state.generatorState?.response
             val meta = getMetaData()
             val rawName = meta.name ?: currentLoadResponse?.name
             val cleanedName = cleanSubtitleTitle(rawName)
