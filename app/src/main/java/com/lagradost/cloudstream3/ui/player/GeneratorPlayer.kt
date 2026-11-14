@@ -532,8 +532,13 @@ class GeneratorPlayer : FullScreenPlayer() {
         // load player
         context?.let { ctx ->
             val (url, uri) = link
+            val cachedSub = if (!sameEpisode) getCachedSubtitle() else null
+            if (cachedSub != null && !viewModel.state.subtitles.contains(cachedSub)) {
+                viewModel.addSubtitles(setOf(cachedSub))
+            }
             val subtitles = viewModel.state.subtitles
             val autoSelected = (if (sameEpisode) currentSelectedSubtitles else null)
+                ?: cachedSub
                 ?: getAutoSelectSubtitle(
                     subtitles, settings = true, downloads = true
                 )
@@ -902,6 +907,7 @@ class GeneratorPlayer : FullScreenPlayer() {
         if (subtitleData.isEmpty()) return
         val ctx = context ?: return
         val selectedSubtitle = subtitleData.first()
+        saveCachedSubtitle(selectedSubtitle)
         viewModel.addSubtitles(subtitleData.toSet())
 
         // this is used instead of observe(viewModel._currentSubs), because observe is too slow
@@ -1054,23 +1060,38 @@ class GeneratorPlayer : FullScreenPlayer() {
             .trim()
     }
 
+    private fun getSubtitleCacheKey(): String? {
+        val id = viewModel.state.generatorState?.id
+            ?: (currentMeta as? ResultEpisode)?.id
+            ?: (currentMeta as? ExtractorUri)?.id
+        return id?.let { "saved_online_sub_$it" }
+    }
+
+    private fun saveCachedSubtitle(subtitle: SubtitleData) {
+        if (subtitle.origin == SubtitleOrigin.EMBEDDED_IN_VIDEO) return
+        val key = getSubtitleCacheKey() ?: return
+        runCatching { setKey(key, subtitle) }
+    }
+
+    private fun getCachedSubtitle(): SubtitleData? {
+        val key = getSubtitleCacheKey() ?: return null
+        return runCatching { getKey<SubtitleData>(key) }.getOrNull()
+    }
+
     private fun isMatchingEpisode(entryName: String, season: Int?, episode: Int?): Boolean {
         if (episode == null) return true
         val s = season ?: 1
-        val sPad = s.toString().padStart(2, '0')
-        val ePad = episode.toString().padStart(2, '0')
 
-        val patterns = listOf(
+        val matchPatterns = listOf(
             Regex("(?i)\\bS0?${s}[ ._-]*E0?${episode}\\b"),
             Regex("(?i)\\b${s}x0?${episode}\\b"),
             Regex("(?i)\\b(?:E|Ep|Episode)[ ._-]*0?${episode}\\b")
         )
-        val hasExplicitPattern = Regex("(?i)\\bS\\d{1,2}[ ._-]*E\\d{1,3}\\b|\\b\\d{1,2}x\\d{1,3}\\b")
-        return if (hasExplicitPattern.containsMatchIn(entryName)) {
-            patterns.any { it.containsMatchIn(entryName) }
+        val anyEpisodePattern = Regex("(?i)\\bS\\d{1,2}[ ._-]*E\\d{1,3}\\b|\\b\\d{1,2}x\\d{1,3}\\b|\\b(?:E|Ep|Episode)[ ._-]*\\d{1,3}\\b")
+        return if (anyEpisodePattern.containsMatchIn(entryName)) {
+            matchPatterns.any { it.containsMatchIn(entryName) }
         } else {
-            entryName.contains("S${sPad}E${ePad}", ignoreCase = true) ||
-                patterns.any { it.containsMatchIn(entryName) }
+            true // Keep if filename has no episode tag; API already filtered by season/episode
         }
     }
 
@@ -1116,24 +1137,54 @@ class GeneratorPlayer : FullScreenPlayer() {
             )
 
             var hasSelected = false
+            var totalFound = 0
+            var lastError: String? = null
 
-            suspend fun tryProviders(query: SubtitleSearch) {
+            fun matchesTargetLang(entryLang: String, target: String): Boolean {
+                val e = entryLang.trim().lowercase()
+                val t = target.trim().lowercase()
+                if (e == t || e.startsWith("$t-") || e.startsWith("${t}_")) return true
+                if (t == "bn" || t == "ben") {
+                    return e in listOf("bn", "ben", "bangla", "bengali", "bn-bd", "bn-in") ||
+                        e.contains("bangla") || e.contains("bengali")
+                }
+                return false
+            }
+
+            suspend fun tryProviders(query: SubtitleSearch, filterByLang: Boolean = false) {
                 subsProviders.toList().amap { provider ->
                     if (hasSelected || !this@launch.isActive) return@amap
 
                     val result = Resource.fromResult(provider.search(query = query))
+                    if (result is Resource.Failure) {
+                        lastError = "${provider.idPrefix}: ${result.errorString}"
+                        return@amap
+                    }
                     val entries = (result as? Resource.Success)?.value ?: return@amap
 
-                    val filtered = if (meta.episode != null) {
-                        entries.filter { isMatchingEpisode(it.name, meta.season, meta.episode) }
+                    val langFiltered = if (filterByLang) {
+                        entries.filter { matchesTargetLang(it.lang, langTag) }
                     } else {
                         entries
+                    }
+
+                    val filtered = if (meta.episode != null) {
+                        langFiltered.filter { isMatchingEpisode(it.name, meta.season, meta.episode) }
+                    } else {
+                        langFiltered
                     }.sortedByDescending { scoreSubtitleEntry(it.name, sourceName) }
+
+                    totalFound += filtered.size
 
                     for (subtitleEntry in filtered) {
                         if (hasSelected || !this@launch.isActive) break
 
-                        val subtitleResources = provider.resource(subtitleEntry).getOrNull() ?: continue
+                        val resResult = Resource.fromResult(provider.resource(subtitleEntry))
+                        if (resResult is Resource.Failure) {
+                            lastError = "${provider.idPrefix} res: ${resResult.errorString}"
+                            continue
+                        }
+                        val subtitleResources = (resResult as? Resource.Success)?.value ?: continue
                         val subtitles = subtitleResources.getSubtitles().map { resource ->
                             SubtitleData(
                                 originalName = resource.name ?: getName(subtitleEntry, true),
@@ -1146,12 +1197,20 @@ class GeneratorPlayer : FullScreenPlayer() {
                             )
                         }
 
-                        if (subtitles.isNotEmpty() && this@launch.isActive &&
-                            !viewModel.state.subtitles.containsAll(subtitles) && !hasSelected
-                        ) {
+                        if (subtitles.isNotEmpty() && this@launch.isActive && !hasSelected) {
                             hasSelected = true
+                            preferredAutoSelectSubtitles = langTag
                             runOnMainThread {
                                 addAndSelectSubtitles(*subtitles.toTypedArray())
+                                setSubtitles(subtitles.first(), false)
+                            }
+                            kotlinx.coroutines.delay(500)
+                            if (this@launch.isActive) {
+                                runOnMainThread {
+                                    if (player.getCurrentPreferredSubtitle() != subtitles.first()) {
+                                        player.setPreferredSubtitles(subtitles.first())
+                                    }
+                                }
                             }
                             break
                         }
@@ -1161,13 +1220,48 @@ class GeneratorPlayer : FullScreenPlayer() {
 
             tryProviders(primaryQuery)
 
-            // Fallback without year if primary query returned nothing
-            if (!hasSelected && this.isActive && primaryQuery.year != null && cleanedName.isNotBlank()) {
+            // Fallback 1: without year
+            if (!hasSelected && this.isActive && primaryQuery.year != null) {
                 tryProviders(primaryQuery.copy(year = null))
             }
 
+            // Fallback 2: raw name without IDs (for providers that fail on ID mismatch)
+            if (!hasSelected && this.isActive && !rawName.isNullOrBlank()) {
+                tryProviders(
+                    primaryQuery.copy(
+                        query = rawName,
+                        imdbId = null,
+                        tmdbId = null,
+                        malId = null,
+                        aniListId = null,
+                        year = null
+                    )
+                )
+            }
+
+            // Fallback 3: search without lang filter and match Bangla manually
+            if (!hasSelected && this.isActive && !rawName.isNullOrBlank()) {
+                tryProviders(
+                    primaryQuery.copy(
+                        query = cleanedName.ifBlank { rawName },
+                        imdbId = null,
+                        tmdbId = null,
+                        malId = null,
+                        aniListId = null,
+                        lang = null,
+                        year = null
+                    ),
+                    filterByLang = true
+                )
+            }
+
             if (!hasSelected && this.isActive) {
-                runOnMainThread { showToast("Auto-sub: no $langTag subtitle found") }
+                val msg = if (totalFound > 0) {
+                    "Auto-sub: $totalFound found, load failed ($lastError)"
+                } else {
+                    "Auto-sub: 0 $langTag found (${subsProviders.size} prov${lastError?.let { ", $it" } ?: ""})"
+                }
+                runOnMainThread { showToast(msg) }
             }
         }
 
