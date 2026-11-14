@@ -681,7 +681,7 @@ class GeneratorPlayer : FullScreenPlayer() {
             currentSubtitle = currentSubtitles.getOrNull(position) ?: return@setOnItemClickListener
         }
 
-        var currentLanguageTagIETF: String = getAutoSelectLanguageTagIETF()
+        var currentLanguageTagIETF: String = getPreferredOnlineSubtitleLang() ?: getAutoSelectLanguageTagIETF()
 
 
         fun setSubtitlesList(list: List<AbstractSubtitleEntities.SubtitleEntity>) {
@@ -1026,9 +1026,17 @@ class GeneratorPlayer : FullScreenPlayer() {
         }
 
     private fun getPreferredOnlineSubtitleLang(): String? {
-        val downloadLang = getKey<List<String>>(SUBTITLE_DOWNLOAD_KEY)
-            ?.firstOrNull { it.isNotBlank() }
-        if (!downloadLang.isNullOrBlank()) return downloadLang
+        val fromList = runCatching { getKey<List<String>>(SUBTITLE_DOWNLOAD_KEY) }
+            .getOrNull()?.firstOrNull { it.isNotBlank() }
+        if (!fromList.isNullOrBlank()) return fromList
+
+        val fromArray = runCatching { getKey<Array<String>>(SUBTITLE_DOWNLOAD_KEY) }
+            .getOrNull()?.firstOrNull { it.isNotBlank() }
+        if (!fromArray.isNullOrBlank()) return fromArray
+
+        val fromString = runCatching { getKey<String>(SUBTITLE_DOWNLOAD_KEY) }
+            .getOrNull()?.takeIf { it.isNotBlank() }
+        if (!fromString.isNullOrBlank()) return fromString
 
         return (preferredAutoSelectSubtitles ?: getAutoSelectLanguageTagIETF())
             ?.takeIf { it.isNotBlank() }
@@ -1083,6 +1091,7 @@ class GeneratorPlayer : FullScreenPlayer() {
     private fun autoFetchOnlineSubtitles(sourceName: String? = null) =
         viewModel.viewModelScope.launch {
             val langTag = getPreferredOnlineSubtitleLang() ?: return@launch
+            runOnMainThread { showToast("Auto-sub: searching $langTag...") }
             val currentLoadResponse = viewModel.state.generatorState?.response
             val meta = getMetaData()
             val rawName = meta.name ?: currentLoadResponse?.name
@@ -1155,6 +1164,10 @@ class GeneratorPlayer : FullScreenPlayer() {
             // Fallback without year if primary query returned nothing
             if (!hasSelected && this.isActive && primaryQuery.year != null && cleanedName.isNotBlank()) {
                 tryProviders(primaryQuery.copy(year = null))
+            }
+
+            if (!hasSelected && this.isActive) {
+                runOnMainThread { showToast("Auto-sub: no $langTag subtitle found") }
             }
         }
 
