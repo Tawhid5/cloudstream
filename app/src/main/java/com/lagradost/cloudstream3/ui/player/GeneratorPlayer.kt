@@ -3,6 +3,14 @@ package com.lagradost.cloudstream3.ui.player
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.Dialog
+import android.net.Uri
+import java.io.ByteArrayInputStream
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.zip.ZipInputStream
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
@@ -1060,22 +1068,66 @@ class GeneratorPlayer : FullScreenPlayer() {
             .trim()
     }
 
-    private fun getSubtitleCacheKey(): String? {
+    data class CachedSubtitleEntry(
+        val id: String,
+        val subtitle: SubtitleData,
+        val savedAt: Long
+    )
+
+    private fun getSubtitleCacheId(): String? {
         val id = viewModel.state.generatorState?.id
             ?: (currentMeta as? ResultEpisode)?.id
             ?: (currentMeta as? ExtractorUri)?.id
-        return id?.let { "saved_online_sub_$it" }
+        return id?.toString()
+    }
+
+    private fun cleanupOldAutoSubFiles() {
+        runCatching {
+            val ctx = context ?: CloudStreamApp.context ?: return
+            val dir = File(ctx.cacheDir, "auto_subs")
+            if (!dir.exists()) return
+            val cutoff = System.currentTimeMillis() - (7L * 24 * 60 * 60 * 1000)
+            dir.listFiles()?.forEach { file ->
+                if (file.lastModified() < cutoff) {
+                    file.delete()
+                }
+            }
+        }
+    }
+
+    private fun getCleanedSubtitleCache(): MutableList<CachedSubtitleEntry> {
+        cleanupOldAutoSubFiles()
+        val now = System.currentTimeMillis()
+        val maxAgeMs = 7L * 24 * 60 * 60 * 1000 // ৭ দিন পর অটো ডিলিট
+        val list = runCatching { getKey<List<CachedSubtitleEntry>>("saved_online_subs_v2") }
+            .getOrNull()
+            .orEmpty()
+            .filter { now - it.savedAt <= maxAgeMs }
+            .sortedByDescending { it.savedAt }
+            .take(50) // সর্বোচ্চ ৫০টি এন্ট্রি রাখবে
+            .toMutableList()
+        return list
     }
 
     private fun saveCachedSubtitle(subtitle: SubtitleData) {
         if (subtitle.origin == SubtitleOrigin.EMBEDDED_IN_VIDEO) return
-        val key = getSubtitleCacheKey() ?: return
-        runCatching { setKey(key, subtitle) }
+        val id = getSubtitleCacheId() ?: return
+        runCatching {
+            val list = getCleanedSubtitleCache()
+            list.removeAll { it.id == id }
+            list.add(0, CachedSubtitleEntry(id, subtitle, System.currentTimeMillis()))
+            setKey("saved_online_subs_v2", list.take(50))
+        }
     }
 
     private fun getCachedSubtitle(): SubtitleData? {
-        val key = getSubtitleCacheKey() ?: return null
-        return runCatching { getKey<SubtitleData>(key) }.getOrNull()
+        val id = getSubtitleCacheId() ?: return null
+        return runCatching {
+            val list = getCleanedSubtitleCache()
+            // পুরনো ডিলিট করা লিস্ট সেভ করে রাখা
+            setKey("saved_online_subs_v2", list)
+            list.firstOrNull { it.id == id }?.subtitle
+        }.getOrNull()
     }
 
     private fun isMatchingEpisode(entryName: String, season: Int?, episode: Int?): Boolean {
@@ -1107,6 +1159,67 @@ class GeneratorPlayer : FullScreenPlayer() {
             }
         }
         return score
+    }
+
+    private suspend fun extractZipSubtitle(
+        zipUrl: String,
+        headers: Map<String, String>,
+        fallbackName: String,
+        lang: String?,
+        season: Int?,
+        episode: Int?
+    ): SubtitleData? = withContext(Dispatchers.IO) {
+        runCatching {
+            val ctx = context ?: CloudStreamApp.context ?: return@runCatching null
+            val conn = (URL(zipUrl).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 15000
+                readTimeout = 15000
+                instanceFollowRedirects = true
+                headers.forEach { (k, v) -> setRequestProperty(k, v) }
+            }
+            val bytes = conn.inputStream.use { it.readBytes() }
+            conn.disconnect()
+
+            val subExts = listOf(".srt", ".vtt", ".ass", ".ssa", ".sub")
+            val candidates = mutableListOf<Pair<String, ByteArray>>()
+
+            ZipInputStream(ByteArrayInputStream(bytes)).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    val name = entry.name
+                    if (!entry.isDirectory && subExts.any { name.lowercase().endsWith(it) }) {
+                        candidates.add(name to zis.readBytes())
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+
+            if (candidates.isEmpty()) return@runCatching null
+
+            val chosen = if (episode != null) {
+                candidates.firstOrNull { isMatchingEpisode(it.first, season, episode) }
+                    ?: candidates.first()
+            } else {
+                candidates.first()
+            }
+
+            val dir = File(ctx.cacheDir, "auto_subs").apply { mkdirs() }
+            val safeFileName = "${System.currentTimeMillis()}_${File(chosen.first).name}"
+            val outFile = File(dir, safeFileName)
+            outFile.writeBytes(chosen.second)
+
+            val extName = File(chosen.first).name
+            SubtitleData(
+                originalName = if (extName.isNotBlank()) extName else fallbackName,
+                nameSuffix = "",
+                url = Uri.fromFile(outFile).toString(),
+                origin = SubtitleOrigin.DOWNLOADED_FILE,
+                mimeType = extName.toSubtitleMimeType(),
+                headers = emptyMap(),
+                languageCode = lang,
+            )
+        }.getOrNull()
     }
 
     private fun autoFetchOnlineSubtitles(sourceName: String? = null) =
@@ -1185,30 +1298,52 @@ class GeneratorPlayer : FullScreenPlayer() {
                             continue
                         }
                         val subtitleResources = (resResult as? Resource.Success)?.value ?: continue
-                        val subtitles = subtitleResources.getSubtitles().map { resource ->
-                            SubtitleData(
-                                originalName = resource.name ?: getName(subtitleEntry, true),
-                                nameSuffix = "",
-                                url = resource.url,
-                                origin = resource.origin,
-                                mimeType = resource.url.toSubtitleMimeType(),
-                                headers = subtitleEntry.headers,
-                                languageCode = subtitleEntry.lang,
-                            )
-                        }
+                        val subtitles = subtitleResources.getSubtitles()
+                            .filter { res ->
+                                val u = res.url.trim().lowercase()
+                                u.isNotBlank() && !u.endsWith(".rar")
+                            }
+                            .mapNotNull { resource ->
+                                val rawUrl = resource.url.trim()
+                                val baseName = resource.name ?: getName(subtitleEntry, true)
+                                if (rawUrl.lowercase().endsWith(".zip")) {
+                                    extractZipSubtitle(
+                                        zipUrl = rawUrl,
+                                        headers = subtitleEntry.headers,
+                                        fallbackName = baseName,
+                                        lang = subtitleEntry.lang,
+                                        season = meta.season,
+                                        episode = meta.episode
+                                    )
+                                } else {
+                                    SubtitleData(
+                                        originalName = baseName,
+                                        nameSuffix = "",
+                                        url = rawUrl,
+                                        origin = resource.origin,
+                                        mimeType = rawUrl.toSubtitleMimeType(),
+                                        headers = subtitleEntry.headers,
+                                        languageCode = subtitleEntry.lang,
+                                    )
+                                }
+                            }
 
                         if (subtitles.isNotEmpty() && this@launch.isActive && !hasSelected) {
                             hasSelected = true
+                            val picked = subtitles.first()
                             preferredAutoSelectSubtitles = langTag
                             runOnMainThread {
                                 addAndSelectSubtitles(*subtitles.toTypedArray())
-                                setSubtitles(subtitles.first(), false)
+                                setSubtitles(picked, false)
                             }
-                            kotlinx.coroutines.delay(500)
-                            if (this@launch.isActive) {
-                                runOnMainThread {
-                                    if (player.getCurrentPreferredSubtitle() != subtitles.first()) {
-                                        player.setPreferredSubtitles(subtitles.first())
+                            for (waitMs in listOf(450L, 1200L)) {
+                                kotlinx.coroutines.delay(waitMs)
+                                if (this@launch.isActive) {
+                                    runOnMainThread {
+                                        player.setActiveSubtitles(viewModel.state.subtitles)
+                                        if (player.getCurrentPreferredSubtitle() != picked) {
+                                            setSubtitles(picked, false)
+                                        }
                                     }
                                 }
                             }
