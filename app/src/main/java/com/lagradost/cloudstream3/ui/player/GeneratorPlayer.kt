@@ -8,9 +8,15 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
+import java.util.zip.GZIPInputStream
 import java.util.zip.ZipInputStream
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
@@ -565,12 +571,12 @@ class GeneratorPlayer : FullScreenPlayer() {
 
             val targetLang = getPreferredOnlineSubtitleLang()
             val hasPreferredSub = targetLang != null && subtitles.any {
-                it.getIETF_tag()?.equals(targetLang, ignoreCase = true) == true ||
-                    it.languageCode?.equals(targetLang, ignoreCase = true) == true
+                matchesTargetLang(it.getIETF_tag().orEmpty(), targetLang) ||
+                    matchesTargetLang(it.languageCode.orEmpty(), targetLang)
             }
-            if (!sameEpisode && !hasPreferredSub && !hasAutoFetchedSubtitles && subsProvidersIsActive) {
+            if (!sameEpisode && !hasPreferredSub && !hasAutoFetchedSubtitles) {
                 hasAutoFetchedSubtitles = true
-                autoFetchOnlineSubtitles(link.first?.name)
+                autoFetchOnlineSubtitles(link.first?.name, subtitles)
             }
         }
 
@@ -1039,46 +1045,47 @@ class GeneratorPlayer : FullScreenPlayer() {
             }
         }
 
-    private fun getPreferredOnlineSubtitleLang(): String? {
-        val fromList = runCatching { getKey<List<String>>(SUBTITLE_DOWNLOAD_KEY) }
-            .getOrNull()?.firstOrNull { it.isNotBlank() }
-        if (!fromList.isNullOrBlank()) return fromList
-
-        val fromArray = runCatching { getKey<Array<String>>(SUBTITLE_DOWNLOAD_KEY) }
-            .getOrNull()?.firstOrNull { it.isNotBlank() }
-        if (!fromArray.isNullOrBlank()) return fromArray
-
-        val fromString = runCatching { getKey<String>(SUBTITLE_DOWNLOAD_KEY) }
-            .getOrNull()?.takeIf { it.isNotBlank() }
-        if (!fromString.isNullOrBlank()) return fromString
-
-        return (preferredAutoSelectSubtitles ?: getAutoSelectLanguageTagIETF())
-            ?.takeIf { it.isNotBlank() }
-    }
-
-    private fun cleanSubtitleTitle(rawTitle: String?): String {
-        if (rawTitle.isNullOrBlank()) return ""
-        return rawTitle
-            .replace(Regex("\\[.*?\\]|\\(.*?\\)"), " ")
-            .replace(
-                Regex("(?i)\\b(dub|sub|dubbed|subbed|hindi|bangla|bengali|english|dual audio|4k|1080p|720p|480p|web-dl|webrip|bluray|hdrip)\\b"),
-                " "
-            )
-            .replace(Regex("\\s+"), " ")
-            .trim()
-    }
-
     data class CachedSubtitleEntry(
         val id: String,
         val subtitle: SubtitleData,
         val savedAt: Long
     )
 
-    private fun getSubtitleCacheId(): String? {
-        val id = viewModel.state.generatorState?.id
-            ?: (currentMeta as? ResultEpisode)?.id
-            ?: (currentMeta as? ExtractorUri)?.id
-        return id?.toString()
+    data class ParsedDirtyTitle(
+        val cleanTitle: String,
+        val detectedSeason: Int? = null,
+        val detectedEpisode: Int? = null,
+        val detectedYear: Int? = null
+    )
+
+    data class SubtitleCueItem(
+        val startSec: Double,
+        val endSec: Double,
+        val text: String
+    )
+
+    private fun getPreferredOnlineSubtitleLang(): String? {
+        val downloadLang = runCatching { SubtitlesFragment.getDownloadSubsLanguageTagIETF() }
+            .getOrNull()?.firstOrNull { it.isNotBlank() }
+        if (!downloadLang.isNullOrBlank()) return downloadLang
+
+        return (preferredAutoSelectSubtitles ?: getAutoSelectLanguageTagIETF())
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun matchesTargetLang(entryLang: String, target: String): Boolean {
+        val e = entryLang.trim().lowercase()
+        val t = target.trim().lowercase()
+        if (e.isBlank() || t.isBlank()) return false
+        if (e == t || e.startsWith("$t-") || e.startsWith("${t}_")) return true
+        if (t == "bn" || t == "ben") {
+            return e in listOf("bn", "ben", "bangla", "bengali", "bn-bd", "bn-in") ||
+                e.contains("bangla") || e.contains("bengali")
+        }
+        if (t == "en" || t == "eng") {
+            return e in listOf("en", "eng", "english", "en-us", "en-gb")
+        }
+        return false
     }
 
     private fun cleanupOldAutoSubFiles() {
@@ -1088,25 +1095,29 @@ class GeneratorPlayer : FullScreenPlayer() {
             if (!dir.exists()) return
             val cutoff = System.currentTimeMillis() - (7L * 24 * 60 * 60 * 1000)
             dir.listFiles()?.forEach { file ->
-                if (file.lastModified() < cutoff) {
-                    file.delete()
-                }
+                if (file.lastModified() < cutoff) file.delete()
             }
         }
+    }
+
+    private fun getSubtitleCacheId(): String? {
+        val id = viewModel.state.generatorState?.id
+            ?: (currentMeta as? ResultEpisode)?.id
+            ?: (currentMeta as? ExtractorUri)?.id
+        return id?.toString()
     }
 
     private fun getCleanedSubtitleCache(): MutableList<CachedSubtitleEntry> {
         cleanupOldAutoSubFiles()
         val now = System.currentTimeMillis()
-        val maxAgeMs = 7L * 24 * 60 * 60 * 1000 // ৭ দিন পর অটো ডিলিট
-        val list = runCatching { getKey<List<CachedSubtitleEntry>>("saved_online_subs_v2") }
+        val maxAgeMs = 7L * 24 * 60 * 60 * 1000
+        return runCatching { getKey<List<CachedSubtitleEntry>>("saved_online_subs_v2") }
             .getOrNull()
             .orEmpty()
             .filter { now - it.savedAt <= maxAgeMs }
             .sortedByDescending { it.savedAt }
-            .take(50) // সর্বোচ্চ ৫০টি এন্ট্রি রাখবে
+            .take(50)
             .toMutableList()
-        return list
     }
 
     private fun saveCachedSubtitle(subtitle: SubtitleData) {
@@ -1124,281 +1135,521 @@ class GeneratorPlayer : FullScreenPlayer() {
         val id = getSubtitleCacheId() ?: return null
         return runCatching {
             val list = getCleanedSubtitleCache()
-            // পুরনো ডিলিট করা লিস্ট সেভ করে রাখা
             setKey("saved_online_subs_v2", list)
             list.firstOrNull { it.id == id }?.subtitle
         }.getOrNull()
     }
 
-    private fun isMatchingEpisode(entryName: String, season: Int?, episode: Int?): Boolean {
-        if (episode == null) return true
-        val s = season ?: 1
+    private fun parseDirtyMediaTitle(rawTitle: String?): ParsedDirtyTitle {
+        val s = rawTitle?.trim().orEmpty()
+        if (s.isBlank()) return ParsedDirtyTitle("")
 
-        val matchPatterns = listOf(
-            Regex("(?i)\\bS0?${s}[ ._-]*E0?${episode}\\b"),
-            Regex("(?i)\\b${s}x0?${episode}\\b"),
-            Regex("(?i)\\b(?:E|Ep|Episode)[ ._-]*0?${episode}\\b")
-        )
-        val anyEpisodePattern = Regex("(?i)\\bS\\d{1,2}[ ._-]*E\\d{1,3}\\b|\\b\\d{1,2}x\\d{1,3}\\b|\\b(?:E|Ep|Episode)[ ._-]*\\d{1,3}\\b")
-        return if (anyEpisodePattern.containsMatchIn(entryName)) {
-            matchPatterns.any { it.containsMatchIn(entryName) }
+        var detectedSeason: Int? = null
+        var detectedEpisode: Int? = null
+        var detectedYear: Int? = null
+
+        val seMatch = Regex("(?i)(?:\\b|·|\\s)S(\\d{1,2})[\\s._-]*E(\\d{1,3})\\b").find(s)
+            ?: Regex("(?i)\\bSeason[\\s._-]*(\\d{1,2})[\\s._-]*(?:Episode|Ep)[\\s._-]*(\\d{1,3})\\b").find(s)
+            ?: Regex("(?i)\\b(\\d{1,2})x(\\d{1,3})\\b").find(s)
+
+        if (seMatch != null) {
+            detectedSeason = seMatch.groupValues[1].toIntOrNull()?.coerceAtLeast(1)
+            detectedEpisode = seMatch.groupValues[2].toIntOrNull()?.coerceAtLeast(1)
         } else {
-            true // Keep if filename has no episode tag; API already filtered by season/episode
+            Regex("(?i)\\b(?:Season|S)[\\s._-]*(\\d{1,2})\\b").find(s)?.let {
+                detectedSeason = it.groupValues[1].toIntOrNull()?.coerceAtLeast(1)
+            }
+            Regex("(?i)\\b(?:Episode|Ep)[\\s._-]*(\\d{1,3})\\b").find(s)?.let {
+                detectedEpisode = it.groupValues[1].toIntOrNull()?.coerceAtLeast(1)
+            }
         }
+
+        Regex("\\b((?:19|20)\\d{2})\\b").find(s)?.let {
+            detectedYear = it.groupValues[1].toIntOrNull()
+        }
+
+        val cleanTitle = s
+            .replace(Regex("\\[[^\\]]*\\]"), " ")
+            .replace(Regex("\\([^)]*\\)"), " ")
+            .replace(Regex("(?i)(?:\\s*·\\s*)?S\\d{1,2}[\\s._-]*E\\d{1,3}.*$"), " ")
+            .replace(Regex("(?i)\\bSeason[\\s._-]*\\d{1,2}.*$"), " ")
+            .replace(Regex("(?i)\\b(?:Episode|Ep)[\\s._-]*\\d{1,3}.*$"), " ")
+            .replace(
+                Regex("(?i)\\b(480p|720p|1080p|2160p|4K|UHD|Full HD|HD|WEB[-.\\s]?DL|WEBRip|BluRay|BDRip|HDRip|DVDRip|BRRip|x264|x265|HEVC|H\\.?264|H\\.?265|10bit|AAC|DDP5\\.1|Dual[\\s._-]?Audio|Multi[\\s._-]?Audio|Hindi[\\s._-]?Dubbed|Bangla[\\s._-]?Dubbed|Dubbed|ESub|Subtitle|Subtitles|Unrated|Extended)\\b"),
+                " "
+            )
+            .replace(Regex("\\b(19|20)\\d{2}\\b.*$"), " ")
+            .replace(Regex("[|·•]+"), " ")
+            .replace(Regex("\\s{2,}"), " ")
+            .trim(' ', '-', '_', ':')
+
+        return ParsedDirtyTitle(
+            cleanTitle = cleanTitle.ifBlank { s },
+            detectedSeason = detectedSeason,
+            detectedEpisode = detectedEpisode,
+            detectedYear = detectedYear
+        )
+    }
+
+    private fun normalizeTitleWords(text: String): List<String> {
+        return text.lowercase()
+            .replace(Regex("['’]"), "")
+            .replace(Regex("[^a-z0-9]+"), " ")
+            .trim()
+            .split(Regex("\\s+"))
+            .filter { it.isNotBlank() }
+    }
+
+    private fun isAccurateTitleMatch(candidateText: String, canonicalTitle: String): Boolean {
+        val candWords = normalizeTitleWords(candidateText)
+        val tWords = normalizeTitleWords(canonicalTitle)
+        if (candWords.isEmpty() || tWords.size < 2) return true
+
+        val startsWithTitle = candWords.size >= tWords.size &&
+            tWords.indices.all { i -> candWords[i] == tWords[i] }
+
+        if (startsWithTitle) {
+            val after = candWords.drop(tWords.size)
+            val markerIdx = after.indexOfFirst { w ->
+                Regex("^s\\d{1,2}e\\d{1,3}$").matches(w) ||
+                    Regex("^\\d{1,2}x\\d{1,3}$").matches(w) ||
+                    Regex("^(19|20)\\d{2}$").matches(w) ||
+                    w == "season"
+            }
+            if (markerIdx == -1 || markerIdx <= 1) return true
+            val between = after.take(markerIdx).filterNot {
+                it in setOf("the", "a", "an", "part", "vol", "aka")
+            }
+            return between.isEmpty()
+        }
+
+        val candJoined = " ${candWords.joinToString(" ")} "
+        val targetJoined = " ${tWords.joinToString(" ")} "
+        val idx = candJoined.indexOf(targetJoined)
+        if (idx != -1) {
+            val tailWords = candJoined.substring(idx + targetJoined.length).trim().split(Regex("\\s+"))
+            val markerIdx = tailWords.indexOfFirst { w ->
+                Regex("^s\\d{1,2}e\\d{1,3}$").matches(w) ||
+                    Regex("^\\d{1,2}x\\d{1,3}$").matches(w) ||
+                    Regex("^(19|20)\\d{2}$").matches(w)
+            }
+            if (markerIdx == -1 || markerIdx <= 1) return true
+        }
+        return false
+    }
+
+    private fun scoreZipEntryForEpisode(fileName: String, targetSeason: Int?, targetEpisode: Int?): Int {
+        val f = fileName.lowercase()
+        var score = 0
+        if (f.endsWith(".srt")) score += 5
+        if (!Regex("\\b(hi|sdh|forced|cc)\\b").containsMatchIn(f)) score += 3
+        if (targetSeason == null || targetEpisode == null) return score
+
+        val seRegex = Regex("(?i)s(\\d{1,2})[\\s._-]*e(\\d{1,3})|(\\d{1,2})x(\\d{1,3})|season[\\s._-]*(\\d{1,2})[\\s._-]*(?:episode|ep)[\\s._-]*(\\d{1,3})")
+        val seMatches = seRegex.findAll(f).toList()
+        if (seMatches.isNotEmpty()) {
+            val exact = seMatches.any { m ->
+                val ms = (m.groupValues[1].ifEmpty { m.groupValues[3] }.ifEmpty { m.groupValues[5] }).toIntOrNull()
+                val me = (m.groupValues[2].ifEmpty { m.groupValues[4] }.ifEmpty { m.groupValues[6] }).toIntOrNull()
+                ms == targetSeason && me == targetEpisode
+            }
+            return if (exact) score + 200 else -500
+        }
+
+        val epRegex = Regex("(?i)(?:^|[\\s._\\-\\[/])(?:e|ep|episode)[\\s._-]*(\\d{1,3})(?=$|[\\s._\\-\\]/])")
+        val epMatches = epRegex.findAll(f).toList()
+        if (epMatches.isNotEmpty()) {
+            val exactEp = epMatches.any { it.groupValues[1].toIntOrNull() == targetEpisode }
+            return if (exactEp) score + 120 else -500
+        }
+        return score
+    }
+
+    private fun evaluateEpisodeMatch(releaseText: String, targetSeason: Int, targetEpisode: Int): Boolean {
+        val combined = releaseText.lowercase()
+        val seRegex = Regex("(?i)s(\\d{1,2})[\\s._-]*e(?:p(?:isode)?)?[\\s._-]*(\\d{1,3})|(\\d{1,2})[\\s]*[x×][\\s]*(\\d{1,3})|season[\\s._-]*(\\d{1,2})[\\s._-]*(?:episode|ep)[\\s._-]*(\\d{1,3})")
+        val seMatches = seRegex.findAll(combined).toList()
+        if (seMatches.isNotEmpty()) {
+            return seMatches.any { m ->
+                val ms = (m.groupValues[1].ifEmpty { m.groupValues[3] }.ifEmpty { m.groupValues[5] }).toIntOrNull()
+                val me = (m.groupValues[2].ifEmpty { m.groupValues[4] }.ifEmpty { m.groupValues[6] }).toIntOrNull()
+                ms == targetSeason && me == targetEpisode
+            }
+        }
+
+        val sOnlyMatches = Regex("(?i)(?:season|s)[\\s._-]*(\\d{1,2})(?![e\\d])").findAll(combined).toList()
+        if (sOnlyMatches.any { m ->
+                val ms = m.groupValues[1].toIntOrNull() ?: 0
+                ms in 1..30 && ms != targetSeason
+            }) {
+            return false
+        }
+
+        val epOnlyMatches = Regex("(?i)(?:episode|ep)[\\s._-]*(\\d{1,3})\\b|\\be(\\d{2,3})\\b").findAll(combined).toList()
+        if (epOnlyMatches.isNotEmpty()) {
+            return epOnlyMatches.any { m ->
+                val me = (m.groupValues[1].ifEmpty { m.groupValues[2] }).toIntOrNull()
+                me == targetEpisode
+            }
+        }
+        return true
     }
 
     private fun scoreSubtitleEntry(entryName: String, sourceName: String?): Int {
         if (sourceName.isNullOrBlank()) return 0
         val tokens = listOf("WEB-DL", "WEBRip", "BluRay", "HDRip", "1080p", "720p", "x265", "x264", "HEVC")
-        var score = 0
-        for (token in tokens) {
-            if (sourceName.contains(token, ignoreCase = true) &&
-                entryName.contains(token, ignoreCase = true)
-            ) {
-                score += 1
+        return tokens.count { t ->
+            sourceName.contains(t, ignoreCase = true) && entryName.contains(t, ignoreCase = true)
+        }
+    }
+
+    private fun parseTimestampSec(ts: String): Double {
+        val parts = ts.trim().replace(',', '.').split(":").mapNotNull { it.toDoubleOrNull() }
+        return when (parts.size) {
+            3 -> parts[0] * 3600 + parts[1] * 60 + parts[2]
+            2 -> parts[0] * 60 + parts[1]
+            else -> 0.0
+        }
+    }
+
+    private fun formatSrtTime(sec: Double): String {
+        val clamped = sec.coerceAtLeast(0.0)
+        val totalMs = (clamped * 1000).toLong()
+        val h = totalMs / 3_600_000
+        val m = (totalMs % 3_600_000) / 60_000
+        val s = (totalMs % 60_000) / 1000
+        val ms = totalMs % 1000
+        return String.format("%02d:%02d:%02d,%03d", h, m, s, ms)
+    }
+
+    private fun parseSubtitleCues(rawContent: String): List<SubtitleCueItem> {
+        val text = rawContent.removePrefix("\uFEFF").replace("\r\n", "\n").replace("\r", "\n")
+        val blocks = text.split(Regex("\\n{2,}"))
+        val cues = mutableListOf<SubtitleCueItem>()
+        val timeRegex = Regex("(\\d{1,2}:\\d{2}(?::\\d{2})?[.,]\\d{1,3})\\s*-->\\s*(\\d{1,2}:\\d{2}(?::\\d{2})?[.,]\\d{1,3})")
+
+        for (block in blocks) {
+            val lines = block.split("\n")
+            val timeIdx = lines.indexOfFirst { it.contains("-->") }
+            if (timeIdx == -1) continue
+            val m = timeRegex.find(lines[timeIdx]) ?: continue
+            val start = parseTimestampSec(m.groupValues[1])
+            val end = parseTimestampSec(m.groupValues[2])
+            val body = lines.drop(timeIdx + 1).joinToString("\n")
+                .replace(Regex("\\{\\\\[^}]*\\}"), "")
+                .replace(Regex("<[^>]+>"), "")
+                .trim()
+            if (body.isNotBlank() && end > start) {
+                cues.add(SubtitleCueItem(start, end, body))
             }
         }
-        return score
+        return cues
     }
 
-    private suspend fun extractZipSubtitle(
-        zipUrl: String,
-        headers: Map<String, String>,
-        fallbackName: String,
-        lang: String?,
-        season: Int?,
-        episode: Int?
-    ): SubtitleData? = withContext(Dispatchers.IO) {
-        runCatching {
-            val ctx = context ?: CloudStreamApp.context ?: return@runCatching null
-            val conn = (URL(zipUrl).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 15000
-                readTimeout = 15000
-                instanceFollowRedirects = true
-                headers.forEach { (k, v) -> setRequestProperty(k, v) }
-            }
-            val bytes = conn.inputStream.use { it.readBytes() }
-            conn.disconnect()
+    private suspend fun translateLinesToBangla(lines: List<String>): List<String> = withContext(Dispatchers.IO) {
+        if (lines.isEmpty()) return@withContext emptyList()
+        val results = lines.toMutableList()
+        val delim = " ||| "
+        val batchSize = 24
+        val batches = lines.chunked(batchSize).mapIndexed { idx, chunk ->
+            (idx * batchSize) to chunk.map { it.replace("\n", " / ").trim() }
+        }
 
-            val subExts = listOf(".srt", ".vtt", ".ass", ".ssa", ".sub")
-            val candidates = mutableListOf<Pair<String, ByteArray>>()
-
-            ZipInputStream(ByteArrayInputStream(bytes)).use { zis ->
-                var entry = zis.nextEntry
-                while (entry != null) {
-                    val name = entry.name
-                    if (!entry.isDirectory && subExts.any { name.lowercase().endsWith(it) }) {
-                        candidates.add(name to zis.readBytes())
-                    }
-                    zis.closeEntry()
-                    entry = zis.nextEntry
-                }
-            }
-
-            if (candidates.isEmpty()) return@runCatching null
-
-            val chosen = if (episode != null) {
-                candidates.firstOrNull { isMatchingEpisode(it.first, season, episode) }
-                    ?: candidates.first()
-            } else {
-                candidates.first()
-            }
-
-            val dir = File(ctx.cacheDir, "auto_subs").apply { mkdirs() }
-            val safeFileName = "${System.currentTimeMillis()}_${File(chosen.first).name}"
-            val outFile = File(dir, safeFileName)
-            outFile.writeBytes(chosen.second)
-
-            val extName = File(chosen.first).name
-            SubtitleData(
-                originalName = if (extName.isNotBlank()) extName else fallbackName,
-                nameSuffix = "",
-                url = Uri.fromFile(outFile).toString(),
-                origin = SubtitleOrigin.DOWNLOADED_FILE,
-                mimeType = extName.toSubtitleMimeType(),
-                headers = emptyMap(),
-                languageCode = lang,
-            )
-        }.getOrNull()
-    }
-
-    private fun autoFetchOnlineSubtitles(sourceName: String? = null) =
-        viewModel.viewModelScope.launch {
-            val langTag = getPreferredOnlineSubtitleLang() ?: return@launch
-            runOnMainThread { showToast("Auto-sub: searching $langTag...") }
-            val currentLoadResponse = viewModel.state.generatorState?.response
-            val meta = getMetaData()
-            val rawName = meta.name ?: currentLoadResponse?.name
-            val cleanedName = cleanSubtitleTitle(rawName)
-            val imdbId = currentLoadResponse?.getImdbId() ?: meta.imdbId
-            val tmdbId = currentLoadResponse?.getTMDbId()?.toIntOrNull()
-            val malId = currentLoadResponse?.getMalId()?.toIntOrNull()
-            val aniListId = currentLoadResponse?.getAniListId()?.toIntOrNull()
-
-            if (cleanedName.isBlank() && imdbId.isNullOrBlank() && tmdbId == null) return@launch
-
-            val primaryQuery = SubtitleSearch(
-                query = cleanedName.ifBlank { rawName.orEmpty() },
-                imdbId = imdbId,
-                tmdbId = tmdbId,
-                malId = malId,
-                aniListId = aniListId,
-                epNumber = meta.episode,
-                seasonNumber = meta.season,
-                lang = langTag,
-                year = viewModel.currentSubtitleYear.value
-            )
-
-            var hasSelected = false
-            var totalFound = 0
-            var lastError: String? = null
-
-            fun matchesTargetLang(entryLang: String, target: String): Boolean {
-                val e = entryLang.trim().lowercase()
-                val t = target.trim().lowercase()
-                if (e == t || e.startsWith("$t-") || e.startsWith("${t}_")) return true
-                if (t == "bn" || t == "ben") {
-                    return e in listOf("bn", "ben", "bangla", "bengali", "bn-bd", "bn-in") ||
-                        e.contains("bangla") || e.contains("bengali")
-                }
-                return false
-            }
-
-            suspend fun tryProviders(query: SubtitleSearch, filterByLang: Boolean = false) {
-                subsProviders.toList().amap { provider ->
-                    if (hasSelected || !this@launch.isActive) return@amap
-
-                    val result = Resource.fromResult(provider.search(query = query))
-                    if (result is Resource.Failure) {
-                        lastError = "${provider.idPrefix}: ${result.errorString}"
-                        return@amap
-                    }
-                    val entries = (result as? Resource.Success)?.value ?: return@amap
-
-                    val langFiltered = if (filterByLang) {
-                        entries.filter { matchesTargetLang(it.lang, langTag) }
-                    } else {
-                        entries
-                    }
-
-                    val filtered = if (meta.episode != null) {
-                        langFiltered.filter { isMatchingEpisode(it.name, meta.season, meta.episode) }
-                    } else {
-                        langFiltered
-                    }.sortedByDescending { scoreSubtitleEntry(it.name, sourceName) }
-
-                    totalFound += filtered.size
-
-                    for (subtitleEntry in filtered) {
-                        if (hasSelected || !this@launch.isActive) break
-
-                        val resResult = Resource.fromResult(provider.resource(subtitleEntry))
-                        if (resResult is Resource.Failure) {
-                            lastError = "${provider.idPrefix} res: ${resResult.errorString}"
-                            continue
-                        }
-                        val subtitleResources = (resResult as? Resource.Success)?.value ?: continue
-                        val subtitles = subtitleResources.getSubtitles()
-                            .filter { res ->
-                                val u = res.url.trim().lowercase()
-                                u.isNotBlank() && !u.endsWith(".rar")
+        coroutineScope {
+            batches.chunked(6).forEach { group ->
+                group.map { (startIdx, chunk) ->
+                    async {
+                        runCatching {
+                            val joined = chunk.joinToString(delim)
+                            val url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=bn&dt=t&q=${URLEncoder.encode(joined, "UTF-8")}"
+                            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                                connectTimeout = 8000
+                                readTimeout = 8000
+                                setRequestProperty("User-Agent", "Mozilla/5.0")
                             }
-                            .mapNotNull { resource ->
-                                val rawUrl = resource.url.trim()
-                                val baseName = resource.name ?: getName(subtitleEntry, true)
-                                if (rawUrl.lowercase().endsWith(".zip")) {
-                                    extractZipSubtitle(
-                                        zipUrl = rawUrl,
-                                        headers = subtitleEntry.headers,
-                                        fallbackName = baseName,
-                                        lang = subtitleEntry.lang,
-                                        season = meta.season,
-                                        episode = meta.episode
-                                    )
-                                } else {
-                                    SubtitleData(
-                                        originalName = baseName,
-                                        nameSuffix = "",
-                                        url = rawUrl,
-                                        origin = resource.origin,
-                                        mimeType = rawUrl.toSubtitleMimeType(),
-                                        headers = subtitleEntry.headers,
-                                        languageCode = subtitleEntry.lang,
-                                    )
+                            if (conn.responseCode == 200) {
+                                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                                val root = JSONArray(body)
+                                val segments = root.optJSONArray(0)
+                                val sb = StringBuilder()
+                                if (segments != null) {
+                                    for (i in 0 until segments.length()) {
+                                        sb.append(segments.optJSONArray(i)?.optString(0).orEmpty())
+                                    }
                                 }
-                            }
-
-                        if (subtitles.isNotEmpty() && this@launch.isActive && !hasSelected) {
-                            hasSelected = true
-                            val picked = subtitles.first()
-                            preferredAutoSelectSubtitles = langTag
-                            runOnMainThread {
-                                addAndSelectSubtitles(*subtitles.toTypedArray())
-                                setSubtitles(picked, false)
-                            }
-                            for (waitMs in listOf(450L, 1200L)) {
-                                kotlinx.coroutines.delay(waitMs)
-                                if (this@launch.isActive) {
-                                    runOnMainThread {
-                                        player.setActiveSubtitles(viewModel.state.subtitles)
-                                        if (player.getCurrentPreferredSubtitle() != picked) {
-                                            setSubtitles(picked, false)
+                                val parts = sb.toString().split(Regex("\\s*\\|\\|\\|\\s*"))
+                                if (parts.size == chunk.size) {
+                                    parts.forEachIndexed { offset, p ->
+                                        if (p.isNotBlank()) {
+                                            results[startIdx + offset] = p.trim().replace(Regex("\\s*/\\s*"), "\n")
                                         }
                                     }
                                 }
                             }
+                            conn.disconnect()
+                        }
+                    }
+                }.awaitAll()
+            }
+        }
+        results
+    }
+
+    private suspend fun downloadAndUnpackSubtitleText(
+        url: String,
+        headers: Map<String, String>,
+        season: Int?,
+        episode: Int?
+    ): Pair<String, String>? = withContext(Dispatchers.IO) {
+        runCatching {
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 15000
+                readTimeout = 15000
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36")
+                headers.forEach { (k, v) -> setRequestProperty(k, v) }
+            }
+            if (conn.responseCode !in 200..299) {
+                conn.disconnect()
+                return@runCatching null
+            }
+            val bytes = conn.inputStream.use { it.readBytes() }
+            conn.disconnect()
+            if (bytes.size < 16) return@runCatching null
+
+            if (bytes[0] == 0x1f.toByte() && bytes[1] == 0x8b.toByte()) {
+                val text = GZIPInputStream(ByteArrayInputStream(bytes)).bufferedReader().use { it.readText() }
+                return@runCatching ("subtitle.srt" to text)
+            }
+
+            if (bytes[0] == 0x50.toByte() && bytes[1] == 0x4b.toByte()) {
+                val subExts = listOf(".srt", ".vtt", ".ass", ".ssa", ".sub")
+                val entries = mutableListOf<Triple<String, String, Int>>()
+                ZipInputStream(ByteArrayInputStream(bytes)).use { zis ->
+                    var entry = zis.nextEntry
+                    while (entry != null) {
+                        val name = entry.name
+                        if (!entry.isDirectory && !name.lowercase().contains("__macosx") &&
+                            subExts.any { name.lowercase().endsWith(it) }
+                        ) {
+                            val text = zis.readBytes().toString(Charsets.UTF_8)
+                            if (text.trim().length > 20) {
+                                entries.add(Triple(File(name).name, text, scoreZipEntryForEpisode(name, season, episode)))
+                            }
+                        }
+                        zis.closeEntry()
+                        entry = zis.nextEntry
+                    }
+                }
+                if (entries.isEmpty()) return@runCatching null
+                entries.sortWith(compareByDescending<Triple<String, String, Int>> { it.third }.thenByDescending { it.second.length })
+                if (season != null && episode != null && entries.first().third < 0) {
+                    return@runCatching null
+                }
+                return@runCatching (entries.first().first to entries.first().second)
+            }
+
+            val text = bytes.toString(Charsets.UTF_8)
+            if (text.contains("-->")) ("subtitle.srt" to text) else null
+        }.getOrNull()
+    }
+
+    private suspend fun translateAndSaveSrt(
+        rawText: String,
+        displayName: String,
+        targetLang: String
+    ): SubtitleData? = withContext(Dispatchers.IO) {
+        val ctx = context ?: CloudStreamApp.context ?: return@withContext null
+        val cues = parseSubtitleCues(rawText)
+        if (cues.isEmpty()) return@withContext null
+
+        val translatedTexts = translateLinesToBangla(cues.map { it.text })
+        val srtBody = cues.mapIndexed { idx, c ->
+            "${idx + 1}\n${formatSrtTime(c.startSec)} --> ${formatSrtTime(c.endSec)}\n${translatedTexts[idx]}\n"
+        }.joinToString("\n")
+
+        val dir = File(ctx.cacheDir, "auto_subs").apply { mkdirs() }
+        val outFile = File(dir, "${System.currentTimeMillis()}_bn_auto.srt")
+        outFile.writeText(srtBody, Charsets.UTF_8)
+
+        SubtitleData(
+            originalName = "বাংলা (Auto) · $displayName",
+            nameSuffix = "",
+            url = Uri.fromFile(outFile).toString(),
+            origin = SubtitleOrigin.DOWNLOADED_FILE,
+            mimeType = "subtitle.srt".toSubtitleMimeType(),
+            headers = emptyMap(),
+            languageCode = targetLang
+        )
+    }
+
+    private fun autoFetchOnlineSubtitles(
+        sourceName: String? = null,
+        existingSubs: Set<SubtitleData> = emptySet()
+    ) = viewModel.viewModelScope.launch {
+        val langTag = getPreferredOnlineSubtitleLang() ?: return@launch
+        val currentLoadResponse = viewModel.state.generatorState?.response
+        val meta = getMetaData()
+        val rawName = meta.name ?: currentLoadResponse?.name
+        val parsed = parseDirtyMediaTitle(rawName)
+        val cleanedName = parsed.cleanTitle
+        val season = meta.season ?: parsed.detectedSeason
+        val episode = meta.episode ?: parsed.detectedEpisode
+        val year = viewModel.currentSubtitleYear.value ?: parsed.detectedYear
+
+        val imdbId = currentLoadResponse?.getImdbId() ?: meta.imdbId
+        val tmdbId = currentLoadResponse?.getTMDbId()?.toIntOrNull()
+        val malId = currentLoadResponse?.getMalId()?.toIntOrNull()
+        val aniListId = currentLoadResponse?.getAniListId()?.toIntOrNull()
+
+        if (cleanedName.isBlank() && imdbId.isNullOrBlank() && tmdbId == null) return@launch
+
+        var hasSelected = false
+
+        suspend fun applyPickedSubtitle(picked: SubtitleData, all: List<SubtitleData>) {
+            hasSelected = true
+            preferredAutoSelectSubtitles = langTag
+            runOnMainThread {
+                addAndSelectSubtitles(*all.toTypedArray())
+                setSubtitles(picked, false)
+            }
+            for (waitMs in listOf(450L, 1200L)) {
+                kotlinx.coroutines.delay(waitMs)
+                if (this@launch.isActive) {
+                    runOnMainThread {
+                        player.setActiveSubtitles(viewModel.state.subtitles)
+                        if (player.getCurrentPreferredSubtitle() != picked) {
+                            setSubtitles(picked, false)
+                        }
+                    }
+                }
+            }
+        }
+
+        suspend fun searchAndLoad(query: SubtitleSearch, targetLang: String, filterLangManually: Boolean, translateToBn: Boolean) {
+            if (!subsProvidersIsActive || hasSelected || !this@launch.isActive) return
+            subsProviders.toList().amap { provider ->
+                if (hasSelected || !this@launch.isActive) return@amap
+
+                val result = Resource.fromResult(provider.search(query = query))
+                val entries = (result as? Resource.Success)?.value ?: return@amap
+
+                val filtered = entries
+                    .filter { !filterLangManually || matchesTargetLang(it.lang, targetLang) }
+                    .filter { isAccurateTitleMatch(it.name, cleanedName) || !query.imdbId.isNullOrBlank() }
+                    .filter { episode == null || evaluateEpisodeMatch(it.name, season ?: 1, episode) }
+                    .sortedByDescending { scoreSubtitleEntry(it.name, sourceName) }
+
+                for (entry in filtered) {
+                    if (hasSelected || !this@launch.isActive) break
+                    val resResult = Resource.fromResult(provider.resource(entry))
+                    val subRes = (resResult as? Resource.Success)?.value ?: continue
+
+                    for (resource in subRes.getSubtitles()) {
+                        if (hasSelected || !this@launch.isActive) break
+                        val rawUrl = resource.url.trim()
+                        if (rawUrl.isBlank() || rawUrl.lowercase().endsWith(".rar")) continue
+
+                        val baseName = resource.name ?: getName(entry, true)
+                        if (translateToBn) {
+                            val unpacked = downloadAndUnpackSubtitleText(rawUrl, entry.headers, season, episode) ?: continue
+                            val bnSub = translateAndSaveSrt(unpacked.second, baseName, langTag) ?: continue
+                            applyPickedSubtitle(bnSub, listOf(bnSub))
+                            break
+                        } else if (rawUrl.lowercase().endsWith(".zip") || rawUrl.lowercase().endsWith(".gz") || rawUrl.contains("/download")) {
+                            val unpacked = downloadAndUnpackSubtitleText(rawUrl, entry.headers, season, episode) ?: continue
+                            val ctx = context ?: CloudStreamApp.context ?: continue
+                            val dir = File(ctx.cacheDir, "auto_subs").apply { mkdirs() }
+                            val outFile = File(dir, "${System.currentTimeMillis()}_${unpacked.first}")
+                            outFile.writeText(unpacked.second, Charsets.UTF_8)
+                            val subData = SubtitleData(
+                                originalName = unpacked.first.ifBlank { baseName },
+                                nameSuffix = "",
+                                url = Uri.fromFile(outFile).toString(),
+                                origin = SubtitleOrigin.DOWNLOADED_FILE,
+                                mimeType = unpacked.first.toSubtitleMimeType(),
+                                headers = emptyMap(),
+                                languageCode = entry.lang
+                            )
+                            applyPickedSubtitle(subData, listOf(subData))
+                            break
+                        } else {
+                            val subData = SubtitleData(
+                                originalName = baseName,
+                                nameSuffix = "",
+                                url = rawUrl,
+                                origin = resource.origin,
+                                mimeType = rawUrl.toSubtitleMimeType(),
+                                headers = entry.headers,
+                                languageCode = entry.lang
+                            )
+                            applyPickedSubtitle(subData, listOf(subData))
                             break
                         }
                     }
                 }
             }
+        }
 
-            tryProviders(primaryQuery)
+        val primaryQuery = SubtitleSearch(
+            query = cleanedName.ifBlank { rawName.orEmpty() },
+            imdbId = imdbId,
+            tmdbId = tmdbId,
+            malId = malId,
+            aniListId = aniListId,
+            epNumber = episode,
+            seasonNumber = season,
+            lang = langTag,
+            year = year
+        )
 
-            // Fallback 1: without year
-            if (!hasSelected && this.isActive && primaryQuery.year != null) {
-                tryProviders(primaryQuery.copy(year = null))
+        searchAndLoad(primaryQuery, langTag, filterLangManually = false, translateToBn = false)
+        if (!hasSelected && year != null) {
+            searchAndLoad(primaryQuery.copy(year = null), langTag, filterLangManually = false, translateToBn = false)
+        }
+        if (!hasSelected && !rawName.isNullOrBlank()) {
+            searchAndLoad(
+                primaryQuery.copy(query = cleanedName, imdbId = null, tmdbId = null, malId = null, aniListId = null, year = null),
+                langTag,
+                filterLangManually = false,
+                translateToBn = false
+            )
+        }
+        if (!hasSelected && !rawName.isNullOrBlank()) {
+            searchAndLoad(
+                primaryQuery.copy(query = cleanedName, imdbId = null, tmdbId = null, malId = null, aniListId = null, lang = null, year = null),
+                langTag,
+                filterLangManually = true,
+                translateToBn = false
+            )
+        }
+
+        val isTargetBangla = matchesTargetLang(langTag, "bn")
+        if (!hasSelected && isTargetBangla && this.isActive) {
+            val existingEn = existingSubs.firstOrNull {
+                matchesTargetLang(it.getIETF_tag().orEmpty(), "en") ||
+                    matchesTargetLang(it.languageCode.orEmpty(), "en")
             }
-
-            // Fallback 2: raw name without IDs (for providers that fail on ID mismatch)
-            if (!hasSelected && this.isActive && !rawName.isNullOrBlank()) {
-                tryProviders(
-                    primaryQuery.copy(
-                        query = rawName,
-                        imdbId = null,
-                        tmdbId = null,
-                        malId = null,
-                        aniListId = null,
-                        year = null
-                    )
-                )
-            }
-
-            // Fallback 3: search without lang filter and match Bangla manually
-            if (!hasSelected && this.isActive && !rawName.isNullOrBlank()) {
-                tryProviders(
-                    primaryQuery.copy(
-                        query = cleanedName.ifBlank { rawName },
-                        imdbId = null,
-                        tmdbId = null,
-                        malId = null,
-                        aniListId = null,
-                        lang = null,
-                        year = null
-                    ),
-                    filterByLang = true
-                )
-            }
-
-            if (!hasSelected && this.isActive) {
-                val msg = if (totalFound > 0) {
-                    "Auto-sub: $totalFound found, load failed ($lastError)"
-                } else {
-                    "Auto-sub: 0 $langTag found (${subsProviders.size} prov${lastError?.let { ", $it" } ?: ""})"
+            if (existingEn != null && existingEn.url.startsWith("http")) {
+                val unpacked = downloadAndUnpackSubtitleText(existingEn.url, existingEn.headers, season, episode)
+                if (unpacked != null) {
+                    val bnSub = translateAndSaveSrt(unpacked.second, existingEn.name, langTag)
+                    if (bnSub != null) applyPickedSubtitle(bnSub, listOf(bnSub))
                 }
-                runOnMainThread { showToast(msg) }
+            }
+            if (!hasSelected && this.isActive) {
+                searchAndLoad(primaryQuery.copy(lang = "en"), "en", filterLangManually = false, translateToBn = true)
+            }
+            if (!hasSelected && this.isActive && !rawName.isNullOrBlank()) {
+                searchAndLoad(
+                    primaryQuery.copy(query = cleanedName, imdbId = null, tmdbId = null, malId = null, aniListId = null, lang = "en", year = null),
+                    "en",
+                    filterLangManually = false,
+                    translateToBn = true
+                )
             }
         }
+    }
 
 
     override fun showMirrorsDialogue() {
